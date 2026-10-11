@@ -1,5 +1,6 @@
 import SwiftUI
 import SQLite3
+import UniformTypeIdentifiers
 
 // ثوابت ومساعدات
 let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
@@ -70,13 +71,48 @@ final class Store: ObservableObject {
     @Published var month = Calendar.current.component(.month, from: Date())
     private var db: OpaquePointer?
 
+    let path: String
+
     init() {
-        let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("accounts.db")
-        sqlite3_open(url.path, &db)
+        path = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("accounts.db").path
+        openDB()
+        reload()
+    }
+
+    func openDB() {
+        sqlite3_open(path, &db)
         run("CREATE TABLE IF NOT EXISTS income(id INTEGER PRIMARY KEY AUTOINCREMENT, d TEXT, src TEXT, amount REAL, note TEXT)")
         run("CREATE TABLE IF NOT EXISTS expenses(id INTEGER PRIMARY KEY AUTOINCREMENT, d TEXT, cat TEXT, amount REAL, note TEXT)")
         run("CREATE TABLE IF NOT EXISTS budgets(cat TEXT PRIMARY KEY, lim REAL)")
+    }
+
+    // نسخة احتياطية: تُنسخ القاعدة إلى ملف مؤقت يُشارَك عبر قائمة المشاركة
+    func backupFile() -> URL {
+        let t = FileManager.default.temporaryDirectory.appendingPathComponent("accounts-\(iso.string(from: Date())).db")
+        try? FileManager.default.removeItem(at: t)
+        try? FileManager.default.copyItem(atPath: path, toPath: t.path)
+        return t
+    }
+
+    // استعادة: يستبدل ملف القاعدة الحالي بالملف المختار
+    func restore(from src: URL) -> Bool {
+        let scoped = src.startAccessingSecurityScopedResource()
+        defer { if scoped { src.stopAccessingSecurityScopedResource() } }
+        sqlite3_close(db)
+        db = nil
+        var ok = false
+        let fm = FileManager.default
+        let tmp = URL(fileURLWithPath: path + ".restore")
+        try? fm.removeItem(at: tmp)
+        do {
+            try fm.copyItem(at: src, to: tmp)
+            try? fm.removeItem(atPath: path)
+            try fm.moveItem(at: tmp, to: URL(fileURLWithPath: path))
+            ok = true
+        } catch {}
+        openDB()
         reload()
+        return ok
     }
 
     var ym: String { String(format: "%04d-%02d", year, month) }
@@ -189,6 +225,9 @@ struct ContentView: View {
     @EnvironmentObject var s: Store
     @State private var form: FormInfo?
     @State private var showBudgets = false
+    @State private var share: ShareItem?
+    @State private var showImporter = false
+    @State private var msg: String?
 
     var rows: [Row] {
         let all = s.inc.map { Row(id: "i\($0.id)", isInc: true, rec: $0) } + s.exp.map { Row(id: "e\($0.id)", isInc: false, rec: $0) }
@@ -270,7 +309,15 @@ struct ContentView: View {
             }
             .background(Color(red: 0.95, green: 0.95, blue: 0.98))
             .navigationTitle("حساباتي")
-            .toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button("الميزانيات") { showBudgets = true } } }
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) { Button("الميزانيات") { showBudgets = true } }
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Menu {
+                        Button("نسخة احتياطية (مشاركة الملف)") { share = ShareItem(url: s.backupFile()) }
+                        Button("استعادة نسخة احتياطية") { showImporter = true }
+                    } label: { Image(systemName: "externaldrive") }
+                }
+            }
             .safeAreaInset(edge: .bottom) {
                 HStack(spacing: 10) {
                     Button { form = FormInfo(isInc: true, rec: nil) } label: { Text("+ دخل / راتب").bold().frame(maxWidth: .infinity).padding().background(Color.green).foregroundColor(.white).cornerRadius(12) }
@@ -280,8 +327,24 @@ struct ContentView: View {
             }
             .sheet(item: $form) { f in FormView(info: f) }
             .sheet(isPresented: $showBudgets) { BudgetView() }
+            .sheet(item: $share) { it in ShareSheet(url: it.url) }
+            .fileImporter(isPresented: $showImporter, allowedContentTypes: [.data]) { res in
+                if case .success(let u) = res { msg = s.restore(from: u) ? "تمت استعادة البيانات." : "تعذّرت الاستعادة." }
+            }
+            .alert(msg ?? "", isPresented: Binding(get: { msg != nil }, set: { if !$0 { msg = nil } })) { Button("حسناً", role: .cancel) {} }
         }
     }
+}
+
+struct ShareItem: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+struct ShareSheet: UIViewControllerRepresentable {
+    let url: URL
+    func makeUIViewController(context: Context) -> UIActivityViewController { UIActivityViewController(activityItems: [url], applicationActivities: nil) }
+    func updateUIViewController(_ vc: UIActivityViewController, context: Context) {}
 }
 
 struct FormView: View {
