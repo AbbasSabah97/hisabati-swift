@@ -1,27 +1,33 @@
-name: Hisabati
-options:
-  bundleIdPrefix: org.hisabati
-  deploymentTarget:
-    iOS: "16.0"
-targets:
-  Hisabati:
-    type: application
-    platform: iOS
-    sources: [Hisabati]
-    info:
-      path: Info.plist
-      properties:
-        CFBundleDisplayName: Hisabati
-        UILaunchScreen: {}
-        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
-        UIFileSharingEnabled: true
-        LSSupportsOpeningDocumentsInPlace: true
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: org.hisabati.app
-        MARKETING_VERSION: "1.0"
-        CURRENT_PROJECT_VERSION: "1"
-        SWIFT_VERSION: "5.0"
-        TARGETED_DEVICE_FAMILY: "1"
-        GENERATE_INFOPLIST_FILE: NO
-        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+name: Build iOS IPA
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: xcodegen generate
+      - name: Build (unsigned)
+        shell: bash
+        run: |
+          xcodebuild -project Hisabati.xcodeproj -scheme Hisabati -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" 2>&1 | tee build.log
+      - name: Package IPA
+        run: |
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/Hisabati.app Payload/
+          zip -r Hisabati.ipa Payload
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hisabati-IPA
+          path: Hisabati.ipa
