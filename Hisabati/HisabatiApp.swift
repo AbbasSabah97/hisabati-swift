@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 
 // ثوابت ومساعدات
 let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+let NOW = "CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)"
 let CATS = ["طعام", "سكن وإيجار", "مواصلات", "فواتير وخدمات", "صحة", "تعليم", "ترفيه", "ملابس", "أخرى"]
 let SRC = ["الراتب", "مكافأة", "أعمال حرة", "أخرى"]
 let MONTHS = ["كانون الثاني", "شباط", "آذار", "نيسان", "أيار", "حزيران", "تموز", "آب", "أيلول", "تشرين الأول", "تشرين الثاني", "كانون الأول"]
@@ -34,6 +35,12 @@ func parseNum(_ s: String) -> Double? {
         .replacingOccurrences(of: "٬", with: "").replacingOccurrences(of: " ", with: "")
     if let v = Double(t), v > 0 { return v }
     return nil
+}
+
+func toI(_ v: Any) -> Int64 {
+    if let i = v as? Int64 { return i }
+    if let d = v as? Double { return Int64(d) }
+    return 0
 }
 
 func toD(_ v: Any) -> Double {
@@ -84,6 +91,80 @@ final class Store: ObservableObject {
         run("CREATE TABLE IF NOT EXISTS income(id INTEGER PRIMARY KEY AUTOINCREMENT, d TEXT, src TEXT, amount REAL, note TEXT)")
         run("CREATE TABLE IF NOT EXISTS expenses(id INTEGER PRIMARY KEY AUTOINCREMENT, d TEXT, cat TEXT, amount REAL, note TEXT)")
         run("CREATE TABLE IF NOT EXISTS budgets(cat TEXT PRIMARY KEY, lim REAL)")
+        migrateSync()
+    }
+
+    // ===== المزامنة عبر ملف JSON في Google Drive (آخر تعديل يفوز) =====
+    let syncTables: [(String, [String])] = [("income", ["d", "src", "amount", "note"]), ("expenses", ["d", "cat", "amount", "note"]), ("budgets", ["cat", "lim"])]
+
+    // يضيف أعمدة uid/upd/del ومحفزات تحدّثها تلقائياً (مطابقة لنسخة الحاسوب)
+    func migrateSync() {
+        for (t, _) in syncTables {
+            for (col, ddl) in [("uid", "TEXT"), ("upd", "INTEGER DEFAULT 0"), ("del", "INTEGER DEFAULT 0")] {
+                run("ALTER TABLE \(t) ADD COLUMN \(col) \(ddl)")
+            }
+            let key = t == "budgets" ? "cat" : "lower(hex(randomblob(16)))"
+            let nk = t == "budgets" ? "NEW.cat" : "lower(hex(randomblob(16)))"
+            run("UPDATE \(t) SET uid=\(key) WHERE uid IS NULL")
+            run("UPDATE \(t) SET upd=\(NOW) WHERE upd IS NULL OR upd=0")
+            run("CREATE TRIGGER IF NOT EXISTS \(t)_ai AFTER INSERT ON \(t) WHEN NEW.uid IS NULL BEGIN UPDATE \(t) SET uid=\(nk), upd=\(NOW) WHERE rowid=NEW.rowid; END")
+            run("CREATE TRIGGER IF NOT EXISTS \(t)_au AFTER UPDATE ON \(t) WHEN NEW.upd=OLD.upd BEGIN UPDATE \(t) SET upd=\(NOW) WHERE rowid=NEW.rowid; END")
+        }
+    }
+
+    func applyRow(_ t: String, _ cols: [String], _ r: [String: Any]) {
+        guard let uid = r["uid"] as? String, let up = (r["upd"] as? NSNumber)?.int64Value else { return }
+        let del = (r["del"] as? NSNumber)?.int64Value ?? 0
+        var vals: [Any] = []
+        for c in cols {
+            if let x = r[c] as? String { vals.append(x) }
+            else if let n = r[c] as? NSNumber { vals.append(n.doubleValue) }
+            else { vals.append("") }
+        }
+        let ex = rows("SELECT upd FROM \(t) WHERE uid=?", [uid])
+        if let first = ex.first {
+            if toI(first[0]) >= up { return }
+            run("UPDATE \(t) SET \(cols.map { $0 + "=?" }.joined(separator: ",")),upd=?,del=? WHERE uid=?", vals + [up, del, uid])
+        } else {
+            run("INSERT INTO \(t)(uid,\(cols.joined(separator: ",")),upd,del) VALUES(\(Array(repeating: "?", count: cols.count + 3).joined(separator: ",")))", [uid] + vals + [up, del])
+        }
+    }
+
+    func mergeAndExport(_ data: Data?) -> Data? {
+        if let data = data, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: [[String: Any]]] {
+            for (t, cols) in syncTables { for r in obj[t] ?? [] { applyRow(t, cols, r) } }
+        }
+        var out: [String: [[String: Any]]] = [:]
+        for (t, cols) in syncTables {
+            let names = ["uid"] + cols + ["upd", "del"]
+            out[t] = rows("SELECT \(names.joined(separator: ",")) FROM \(t)").map { (row: [Any]) -> [String: Any] in
+                var d: [String: Any] = [:]
+                for (i, n) in names.enumerated() { d[n] = row[i] }
+                return d
+            }
+        }
+        return try? JSONSerialization.data(withJSONObject: out)
+    }
+
+    func syncWith(_ url: URL) -> String {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        let fc = NSFileCoordinator()
+        var e1: NSError?
+        var remote: Data?
+        var readOK = false
+        fc.coordinate(readingItemAt: url, options: [], error: &e1) { u in
+            if let d = try? Data(contentsOf: u) { remote = d; readOK = true }
+        }
+        if !readOK { return "تعذّرت قراءة ملف المزامنة. تأكد أن تطبيق Google Drive مثبّت ومسجَّل الدخول، وأن الملف تم تنزيله." }
+        guard let out = mergeAndExport(remote) else { return "تعذّر دمج البيانات." }
+        var e2: NSError?
+        var wrote = false
+        fc.coordinate(writingItemAt: url, options: .forReplacing, error: &e2) { u in
+            do { try out.write(to: u); wrote = true } catch {}
+        }
+        reload()
+        return wrote ? "تمت المزامنة بنجاح ✓" : "تم دمج البيانات لكن تعذّر حفظ الملف في Drive."
     }
 
     // نسخة احتياطية: تُنسخ القاعدة إلى ملف مؤقت يُشارَك عبر قائمة المشاركة
@@ -156,20 +237,20 @@ final class Store: ObservableObject {
 
     func reload() {
         func load(_ t: String, _ col: String) -> [Rec] {
-            rows("SELECT id,d,\(col),amount,note FROM \(t) WHERE substr(d,1,7)=? ORDER BY d DESC,id DESC", [ym]).map {
+            rows("SELECT id,d,\(col),amount,note FROM \(t) WHERE del=0 AND substr(d,1,7)=? ORDER BY d DESC,id DESC", [ym]).map {
                 Rec(id: $0[0] as? Int64 ?? 0, d: $0[1] as? String ?? "", c: $0[2] as? String ?? "", a: toD($0[3]), n: $0[4] as? String ?? "")
             }
         }
         inc = load("income", "src")
         exp = load("expenses", "cat")
         var b: [String: Double] = [:]
-        for r in rows("SELECT cat,lim FROM budgets") { b[r[0] as? String ?? ""] = toD(r[1]) }
+        for r in rows("SELECT cat,lim FROM budgets WHERE del=0") { b[r[0] as? String ?? ""] = toD(r[1]) }
         bud = b
     }
 
     func catSums(_ month: String) -> [(key: String, value: Double)] {
         var o: [String: Double] = [:]
-        for r in rows("SELECT cat,SUM(amount) FROM expenses WHERE substr(d,1,7)=? GROUP BY cat", [month]) { o[r[0] as? String ?? ""] = toD(r[1]) }
+        for r in rows("SELECT cat,SUM(amount) FROM expenses WHERE del=0 AND substr(d,1,7)=? GROUP BY cat", [month]) { o[r[0] as? String ?? ""] = toD(r[1]) }
         return o.sorted { $0.value > $1.value }
     }
 
@@ -199,12 +280,12 @@ final class Store: ObservableObject {
     }
 
     func remove(isInc: Bool, id: Int64) {
-        run("DELETE FROM \(isInc ? "income" : "expenses") WHERE id=?", [id])
+        run("UPDATE \(isInc ? "income" : "expenses") SET del=1 WHERE id=?", [id])
         reload()
     }
 
     func setBudget(_ c: String, _ v: Double) {
-        if v > 0 { run("REPLACE INTO budgets(cat,lim) VALUES(?,?)", [c, v]) } else { run("DELETE FROM budgets WHERE cat=?", [c]) }
+        if v > 0 { run("INSERT INTO budgets(cat,lim,del) VALUES(?,?,0) ON CONFLICT(cat) DO UPDATE SET lim=excluded.lim, del=0", [c, v]) } else { run("UPDATE budgets SET del=1 WHERE cat=?", [c]) }
     }
 }
 
@@ -227,6 +308,7 @@ struct ContentView: View {
     @State private var showBudgets = false
     @State private var share: ShareItem?
     @State private var showImporter = false
+    @State private var importMode = 0
     @State private var msg: String?
 
     var rows: [Row] {
@@ -259,6 +341,17 @@ struct ContentView: View {
             }
         }
         .frame(height: 150, alignment: .bottom)
+    }
+
+    func syncNow() {
+        var stale = false
+        if let b = UserDefaults.standard.data(forKey: "syncBookmark"),
+           let url = try? URL(resolvingBookmarkData: b, options: [], relativeTo: nil, bookmarkDataIsStale: &stale) {
+            msg = s.syncWith(url)
+        } else {
+            importMode = 1
+            showImporter = true
+        }
     }
 
     var body: some View {
@@ -312,9 +405,13 @@ struct ContentView: View {
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) { Button("الميزانيات") { showBudgets = true } }
                 ToolbarItem(placement: .navigationBarLeading) {
+                    Button { syncNow() } label: { Label("تحديث", systemImage: "arrow.triangle.2.circlepath") }
+                }
+                ToolbarItem(placement: .navigationBarLeading) {
                     Menu {
                         Button("نسخة احتياطية (مشاركة الملف)") { share = ShareItem(url: s.backupFile()) }
-                        Button("استعادة نسخة احتياطية") { showImporter = true }
+                        Button("استعادة نسخة احتياطية") { importMode = 0; showImporter = true }
+                        Button("تغيير ملف المزامنة (Google Drive)") { importMode = 1; showImporter = true }
                     } label: { Image(systemName: "externaldrive") }
                 }
             }
@@ -329,7 +426,16 @@ struct ContentView: View {
             .sheet(isPresented: $showBudgets) { BudgetView() }
             .sheet(item: $share) { it in ShareSheet(url: it.url) }
             .fileImporter(isPresented: $showImporter, allowedContentTypes: [.data]) { res in
-                if case .success(let u) = res { msg = s.restore(from: u) ? "تمت استعادة البيانات." : "تعذّرت الاستعادة." }
+                guard case .success(let u) = res else { return }
+                if importMode == 1 {
+                    if u.startAccessingSecurityScopedResource() {
+                        if let b = try? u.bookmarkData() { UserDefaults.standard.set(b, forKey: "syncBookmark") }
+                        u.stopAccessingSecurityScopedResource()
+                    }
+                    msg = s.syncWith(u)
+                } else {
+                    msg = s.restore(from: u) ? "تمت استعادة البيانات." : "تعذّرت الاستعادة."
+                }
             }
             .alert(msg ?? "", isPresented: Binding(get: { msg != nil }, set: { if !$0 { msg = nil } })) { Button("حسناً", role: .cancel) {} }
         }
